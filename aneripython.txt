@@ -1,0 +1,1573 @@
+-->Air Conditioner (AC)
+
+from gpio import *
+from time import *
+from ioeclient import *
+from environment import *
+from physical import *
+
+HUMIDITY_RATE = -2./3600; # -2% per hour
+TEMPERATURE_RATE = -10./3600; # -10C per hour
+VOLUME_AT_RATE = 100000.
+
+myInput = 0
+
+
+    
+def onInputReceiveDone(data):
+    if  len(data) <= 0:
+        return
+    data = data.split(",")
+    processData(int(data[0]))
+        
+
+def detect():
+    processData(digitalRead(0)/1023)
+  
+def setup():
+    IoEClient.setup({
+        "type": "AC",
+        "states": [{
+            "name": "On",
+            "type": "bool",
+            "controllable": True
+        }]
+    })
+    IoEClient.onInputReceive(onInputReceiveDone)
+    add_event_detect(0, detect)
+    detect()
+    
+    VAR = getDeviceProperty(getName(), "VOLUME_AT_RATE")
+    if not VAR:
+    	setDeviceProperty(getName(), "VOLUME_AT_RATE", VOLUME_AT_RATE)
+
+
+
+def processData(data):
+    global myInput
+    myInput = data
+    if  myInput > 0 :
+        digitalWrite(5, HIGH)
+    else :
+        digitalWrite(5, LOW)
+    IoEClient.reportStates(myInput)
+
+
+def updateEnvironment():
+    VAR = float(getDeviceProperty(getName(), "VOLUME_AT_RATE"))
+    if VAR < 0:
+    	VAR = 0
+
+    humidity_rate = float(myInput*HUMIDITY_RATE*VAR) / Environment.getVolume()
+    temperature_rate = float(myInput*TEMPERATURE_RATE*VAR) / Environment.getVolume()
+    Environment.setContribution("Humidity", humidity_rate, 0, True) 
+    Environment.setContribution("Ambient Temperature", temperature_rate, -1000, True)
+    #print temperature_rate, VAR
+
+def main():
+    setup()
+    while True:
+        updateEnvironment()
+        delay(1000)
+        
+if __name__ == "__main__":
+    main()
+
+-->Fan
+
+from gpio import *
+from time import *
+from ioeclient import *
+from physical import *
+from environment import *
+import math
+FAN_SPEED_LOW = 0.4; # kph
+FAN_SPEED_HIGH = 0.8; # kph
+COOLING_RATE = float(-1)/3600; # -1C/hour
+HUMDITY_REDUCTION_RATE = float(-1)/3600; # -1%/hour
+
+VOLUME_AT_RATE = 100000;    # the given rates are based on this volume
+
+state = 0;  # 0 off, 1 low, 2 high
+level = 0
+
+def main():
+    global state
+    IoEClient.setup({
+        "type": "Ceiling Fan",
+        "states": [
+        {
+            "name": "Status",
+            "type": "options",
+            "options": {
+                "0": "Off",
+                "1": "Low",
+                "2": "High"
+            },
+            "controllable": True
+        }
+        ]
+    })
+
+    IoEClient.onInputReceive(onInputReceiveDone)
+    add_event_detect(0, detect)
+    state = restoreProperty("state", 0)
+    setState(state)
+    while True:
+        delay(1000)
+
+def onInputReceiveDone(data):
+    processData(data, True)
+    
+def detect():
+    processData(customRead(0), False)
+    
+def restoreProperty(propertyName, defaultValue):
+    value = getDeviceProperty(getName(), propertyName)
+    if  not (value is "" or value is None):
+        if  type(defaultValue) is int :
+            value = int(value)
+
+        setDeviceProperty(getName(), propertyName, value)
+        return value
+    return defaultValue
+
+def mouseEvent(pressed, x, y, firstPress):
+    if firstPress:
+        toggleState()
+
+
+def processData(data, bIsRemote):
+    if  len(data) <= 0 :
+        return
+    data = data.split(",")
+    setState(int(data[0]))
+
+def sendReport():
+    global state
+    global report
+    report = state # comma seperated states
+    customWrite(0, report)
+    IoEClient.reportStates(report)
+    setDeviceProperty(getName(), "state", state)
+
+
+def setState(newState):
+    global state
+    analogWrite(A1, newState)
+    state = newState
+
+    sendReport()
+    updateEnvironment()
+
+def toggleState():
+    global state
+    state += 1
+    if  int(state) >= 3:
+        state = 0
+
+    setState(state)
+
+def updateEnvironment():
+    global VOLUME_AT_RATE
+    global FAN_SPEED_LOW
+    global COOLING_RATE
+    global HUMDITY_REDUCTION_RATE
+    global FAN_SPEED_HIGH
+    global state
+    volumeRatio = float(VOLUME_AT_RATE) / Environment.getVolume()
+
+    if  int(state) == 0:
+        Environment.setContribution("Wind Speed", 0, 0, True)
+        Environment.setContribution("Ambient Temperature", 0, 0, True)
+        Environment.setContribution("Humidity", 0,0, True)
+
+    elif  int(state) == 1:
+        Environment.setContribution("Wind Speed", FAN_SPEED_LOW, FAN_SPEED_LOW, False)
+
+        # everytime the fan restarts, it can do another -100C
+        Environment.setContribution("Ambient Temperature", float(COOLING_RATE)/2*volumeRatio, Environment.getCumulativeContribution("Ambient Temperature")-100, True)
+
+        Environment.setContribution("Humidity", float(HUMDITY_REDUCTION_RATE)/2*volumeRatio, Environment.getCumulativeContribution("Humidity")-100, True)
+    elif  int(state) == 2:
+        Environment.setContribution("Wind Speed", FAN_SPEED_HIGH, FAN_SPEED_HIGH, False)
+
+        Environment.setContribution("Ambient Temperature", float(COOLING_RATE)/2*volumeRatio, Environment.getCumulativeContribution("Ambient Temperature")-100, True)
+
+        Environment.setContribution("Humidity", HUMDITY_REDUCTION_RATE*volumeRatio, Environment.getCumulativeContribution("Humidity")-100, True)
+
+if __name__ == "__main__":
+    main()
+
+
+-->Window
+
+from gpio import *
+from time import *
+from ioeclient import *
+from physical import *
+from environment import *
+import math
+
+ENVIRONMENTS = ["Argon", "CO", "CO2", "Hydrogen", "Helium", "Methane", "Nitrogen", "O2", "Ozone", "Propane", "Smoke"]
+ENVIRONMENT_MAX_IMPACT = -0.01; # 2% max when door opens
+TEMPERATURE_TRANSFERENCE_MULTIPLIER = 1.20; # increase speed 25% when door open
+HUMIDITY_TRANSFERENCE_MULTIPLIER = 1.20
+GASES_TRANSFERENCE_MULTIPLIER = 2
+
+state = 0
+
+def main():
+	setup()
+	while True:
+		loop()
+#set up client to talk and listen to IoE registration server
+def setup():
+    IoEClient.setup({
+        "type": "Window",
+        "states": [{
+            "name": "On",
+            "type": "bool",
+            "controllable": True
+        }]
+    })
+
+    IoEClient.onInputReceive(onInputReceiveDone)
+    add_event_detect(0, detect)
+    
+    state = restoreProperty("state", 0)
+    setState(state)
+
+def onInputReceiveDone(data):
+    processData(data, True)
+    
+def detect():
+    processData(customRead(0), false)
+    
+def restoreProperty(propertyName, defaultValue):
+    value = getDeviceProperty(getName(), propertyName)
+    if  not (value is "" or value is None):
+        if  type(defaultValue) is int :
+            value = int(value)
+
+        setDeviceProperty(getName(), propertyName, value)
+        return value
+    return defaultValue
+
+
+def mouseEvent(pressed, x, y, firstPress):
+    global state
+    if firstPress:
+        if state == True:
+        	setState(0)
+        else:
+        	setState(1)
+
+
+#update carbon dioxide and carbon monoxide and send new data to registration server
+def loop():
+    updateEnvironment()
+    delay(1000)
+
+
+#process data received from server
+def processData(data, bIsRemote):
+    if  len(data) <= 0 :
+        return
+    data = data.split(",")
+    setState(int(data[0]))
+
+
+#set state and update component image to reflect the current state
+def setState(newState):
+    global state
+    if  newState is 0 :
+        digitalWrite(1, LOW)
+    else:
+        digitalWrite(1, HIGH)
+    
+    state = newState
+    customWrite(0, state)
+    IoEClient.reportStates(state)
+    setDeviceProperty(getName(), "state", state)
+
+def updateEnvironment():
+    global ENVIRONMENTS
+    global ENVIRONMENT_MAX_IMPACT
+    global GASES_TRANSFERENCE_MULTIPLIER
+    global TEMPERATURE_TRANSFERENCE_MULTIPLIER
+    global HUMIDITY_TRANSFERENCE_MULTIPLIER
+    global state
+
+    if  state == 1:
+        for i in range (0,len(ENVIRONMENTS)):
+            max = Environment.get(ENVIRONMENTS[i]) * ENVIRONMENT_MAX_IMPACT
+            # the max is reached in an hour, so we divide by 3600 to get seconds
+            # then this rate is also based on 100,000 cubic meters (approx. coporate office size)
+            rate = float(max) / 3600 * 100000 / Environment.getVolume()
+            Environment.setContribution(ENVIRONMENTS[i], rate, max, True)
+            Environment.setTransferenceMultiplier(ENVIRONMENTS[i], GASES_TRANSFERENCE_MULTIPLIER)
+
+        Environment.setTransferenceMultiplier("Ambient Temperature", TEMPERATURE_TRANSFERENCE_MULTIPLIER)
+        Environment.setTransferenceMultiplier("Humidity", HUMIDITY_TRANSFERENCE_MULTIPLIER)
+    else:
+        for j in range (0, len(ENVIRONMENTS)):
+            Environment.setContribution(ENVIRONMENTS[j], 0, 0, True)
+            Environment.removeCumulativeContribution(ENVIRONMENTS[j])
+            Environment.setTransferenceMultiplier(ENVIRONMENTS[j], 1)
+
+        Environment.setTransferenceMultiplier("Ambient Temperature", 1)
+        Environment.setTransferenceMultiplier("Humidity", 1)
+
+if __name__ == "__main__":
+    main()
+
+
+-->Door
+
+
+from time import *
+from physical import *
+from gpio import *
+from environment import Environment
+from ioeclient import IoEClient
+
+ENVIRONMENTS = ["Argon", "CO", "CO2", "Hydrogen", "Helium", "Methane", "Nitrogen", "O2", "Ozone", "Propane", "Smoke"]
+ENVIRONMENT_MAX_IMPACT = -0.02 # 2% max when door opens
+TEMPERATURE_TRANSFERENCE_MULTIPLIER = 1.25 # increase speed 25% when door open
+HUMIDITY_TRANSFERENCE_MULTIPLIER = 1.25
+GASES_TRANSFERENCE_MULTIPLIER = 2
+
+doorState = 0 # 0 is closed, 1 is opened
+lockState = 0  # 0 is unlocked, 1 is locked
+
+def on_event_detect_0 () :
+    processData(customRead(0), False)
+
+def on_input_receive(input) :
+    processData(input, True)
+
+def setup ():
+    IoEClient.setup({
+        "type": "Door",
+        "states": [{
+            "name": "Open",
+            "type": "bool"
+        }, 
+        {
+            "name": "Lock",
+            "type": "options",
+            "options": {
+                0: "Unlock",
+                1: "Lock"
+            },
+            "controllable": True
+        }]
+    })
+
+    IoEClient.onInputReceive(on_input_receive) 
+
+    add_event_detect(0, on_event_detect_0)
+
+    setDoorState(doorState)
+    setLockState(lockState)
+
+
+def mouseEvent (pressed, x, y, firstPress):
+    if firstPress:
+        if  isPointInRectangle(x, y, 10,40,5,10) :
+            if  lockState == 0 :
+                setLockState(1)
+            else:
+                setLockState(0)
+        else:
+            if  doorState == 0 :
+                openDoor()
+            else:
+                closeDoor()
+
+def processData (data, bIsRemote):
+    if  len(data) < 1 :
+        return
+
+    print data
+
+    data = data.split(",")
+    doorStateData = int(data[0])
+    lockStateData = int(data[1])
+    if  lockStateData > -1 :
+        setLockState(lockStateData)
+
+    if  doorStateData > -1 and not bIsRemote :
+        if  doorStateData == 0 :
+            closeDoor()
+        else:
+            openDoor()
+
+
+def sendReport ():
+    report = str(doorState)+","+str(lockState)    # comma seperated states
+    customWrite(0, report)
+
+    IoEClient.reportStates(report)
+    setDeviceProperty(getName(), "door state", doorState)
+    setDeviceProperty(getName(), "lock state", lockState)
+
+
+def closeDoor ():
+    setDoorState(0)
+    updateEnvironment()
+
+
+def openDoor ():
+    if  lockState == 0 :
+        setDoorState(1)
+        updateEnvironment()
+    else:
+        print "can't open locked door"
+
+
+def setDoorState (state):
+    global doorState
+    if  state == 0:
+        digitalWrite(1, LOW)
+        setComponentOpacity("led", 1)    # show the led
+    else:
+        digitalWrite(1, HIGH)
+        setComponentOpacity("led", 0)    # hide the led
+
+    doorState = state
+    sendReport()
+
+
+def setLockState (state):
+    global lockState
+    if  state == 0 :
+        digitalWrite(2, LOW)
+    else:
+        digitalWrite(2, HIGH)
+
+    lockState = state
+    sendReport()
+
+
+
+def updateEnvironment ():
+    rate, emax = 0, 0
+    if  doorState == 1:
+        for e in ENVIRONMENTS:
+            emax = Environment.get(e) * ENVIRONMENT_MAX_IMPACT
+            # the emax is reached in an hour, so we divide by 3600 to get seconds
+            # then this rate is also based on 100,000 cubic meters (approx. coporate office size)
+            rate = emax / 3600 * 100000 / Environment.getVolume()
+            Environment.setContribution(e, rate, emax, True)
+            Environment.setTransferenceMultiplier(e, GASES_TRANSFERENCE_MULTIPLIER)
+
+
+        Environment.setTransferenceMultiplier("Ambient Temperature", TEMPERATURE_TRANSFERENCE_MULTIPLIER)
+        Environment.setTransferenceMultiplier("Humidity", HUMIDITY_TRANSFERENCE_MULTIPLIER)
+    else:
+        for e in ENVIRONMENTS:
+            Environment.setContribution(e, 0, 0, True)
+            Environment.removeCumulativeContribution(e)
+            Environment.setTransferenceMultiplier(e, 1)
+
+        Environment.setTransferenceMultiplier("Ambient Temperature", 1)
+        Environment.setTransferenceMultiplier("Humidity", 1)
+
+
+
+def isPointInRectangle (x,y, rx, ry, width, height):
+    if width <= 0 or height <= 0:
+        return False
+    return (x >= rx and x <= rx + width and y >= ry and y <= ry + height)
+
+
+if __name__ == "__main__":
+    setup()
+    while True:
+        sleep(0)
+
+
+
+-->Light
+
+from gpio import *
+from time import *
+from physical import *
+from ioeclient import *
+from environment import *
+
+
+ENVIRONMENT_IMPACT_DIM = 10
+VOLUME_AT_RATE = 100000
+
+state = 0;  # 0 off, 1 low, 2 high
+lastTimeInSeconds = 0
+
+def main():
+    setup()
+    while True:
+        loop()
+
+        
+def setup():
+
+    IoEClient.setup({
+        "type": "Light",
+        "states": [
+        {
+            "name": "Status",
+            "type": "options",
+            "options": {
+                "0": "Off",
+                "1": "Dim",
+                "2": "On"
+            },
+            "controllable": True
+        }
+        ]
+    })
+
+    IoEClient.onInputReceive(onInputReceiveDone)
+    global state
+    add_event_detect(0, detect)
+    state = restoreProperty("state", 0)
+    setState(state)
+
+def detect():
+    processData(customRead(0), False)
+    
+def onInputReceiveDone(analogInput):
+    processData(analogInput, True)
+        
+def restoreProperty(propertyName, defaultValue):
+    value = getDeviceProperty(getName(), propertyName)
+    if  not (value is "" or value is None):
+        if  type(defaultValue) is int :
+            value = int(value)
+
+        setDeviceProperty(getName(), propertyName, value)
+        return value
+    return defaultValue
+
+
+def mouseEvent(pressed, x, y, firstPress):
+    global state
+    if firstPress:
+        setState(state+1)
+
+def loop():
+    updateEnvironment()
+    sleep(1)
+
+
+def processData(data, bIsRemote):
+    if  len(data) <= 0 :
+        return
+    setState(int(data))
+
+
+def setState(newState):
+    global state
+    if newState >= 3 :
+        newState = 0
+    state = newState
+
+    analogWrite(A1, state)
+    customWrite(0, state)
+    IoEClient.reportStates(state)
+    setDeviceProperty(getName(), "state", state)
+
+def updateEnvironment():
+    global VOLUME_AT_RATE
+    global ENVIRONMENT_IMPACT_DIM
+    volumeRatio = float(VOLUME_AT_RATE) / Environment.getVolume()
+    if  state is 0 :
+        Environment.setContribution("Visible Light", 0,0, True)
+    elif  state is 1:
+        Environment.setContribution("Visible Light", ENVIRONMENT_IMPACT_DIM*volumeRatio, ENVIRONMENT_IMPACT_DIM*volumeRatio, False)
+    elif  state is 2 :
+        Environment.setContribution("Visible Light", ENVIRONMENT_IMPACT_DIM*2*volumeRatio, ENVIRONMENT_IMPACT_DIM*2*volumeRatio, False)
+
+if __name__ == "__main__":
+    main()
+
+-->Siren
+
+from gpio import *
+from time import *
+from ioeclient import *
+from physical import *
+state = 0 # 0 off, 1 on
+
+def main():
+	setup()
+	while True:
+		delay(1000)
+		
+def setup():
+    IoEClient.setup({
+        "type": "Siren",
+        "states": [{
+            "name": "On",
+            "type": "bool",
+            "controllable": True
+        }]
+    })
+    global state
+    add_event_detect(0, detect)
+    IoEClient.onInputReceive(onInputReceiveDone)
+    state = restoreProperty("state", 0)
+    setState(state)
+
+def detect():
+    processData(customRead(0), False)
+    
+def onInputReceiveDone(analogInput):
+    processData(analogInput, True)
+	
+def restoreProperty(propertyName, defaultValue):
+    value = getDeviceProperty(getName(), propertyName)
+    if  not (value is "" or value is None):
+        if  type(defaultValue) is int :
+            value = int(value)
+
+        setDeviceProperty(getName(), propertyName, value)
+        return value
+    return defaultValue
+
+
+def mouseEvent(pressed, x, y, firstPress):
+    global state
+    if firstPress:
+    	if state == True:
+    		setState(0)
+    	else:
+    		setState(1)
+
+
+def processData(data, bIsRemote):
+    if  len(data) <= 0 :
+        return
+    setState(int(data))
+
+
+def setState(newState):
+    global state
+    state = newState
+    if state == True:
+        digitalWrite(1, HIGH)
+    else:
+    	digitalWrite(1, LOW)
+    customWrite(0, state)
+    IoEClient.reportStates(state)
+    setDeviceProperty(getName(), "state", state)
+
+if __name__ == "__main__":
+    main()
+
+-->Home Speaker
+
+from time import *
+from physical import *
+from gpio import *
+from environment import Environment
+from ioeclient import IoEClient
+from pyjs import *
+
+VOLUME_AT_RATE = 100000
+SOUND_VOLUME = 65
+SOUND_PITCH = 20
+SOUND_WHITE_NOISE = 20
+
+# Purpose:
+# Home Speaker that can play one of several predefined sounds.
+g_sounds = [JsObject({"soundID": 'sound1', "soundPath": '/../Sounds/buzzLow.wav'}),
+            JsObject({"soundID": 'sound2', "soundPath": '/../Sounds/buzzMedium.wav'}),
+            JsObject({"soundID": 'sound3', "soundPath": '/../Sounds/buzzHigh.wav'})]
+
+g_currSound = -1;
+
+# Purpose:
+# Setup the Home Speaker.  Stop any old sounds and add the sounds to use.
+def setup():
+    global g_currSound
+    setDeviceProperty(getName(), 'SOUND_dB', 0)
+
+    IoEClient.setup ({
+    "type": 'Home Speaker',
+    "states": [{
+        "name": 'Signal',
+        "type": 'number',
+        "controllable": False
+        }]
+    })
+
+    destroySounds()
+
+    for ind in xrange(0 ,len(g_sounds)):        # var ind
+        addSound(g_sounds[ind].soundID, g_sounds[ind].soundPath)
+
+    restoreProperty("SOUND_dB", 0)
+    g_currSound = restoreProperty("Signal", -1)
+
+
+def restoreProperty (propertyName, defaultValue):
+    value = getDeviceProperty(getName(), propertyName)
+#    print "getting:", propertyName, ": ", value
+#    print "default value:", defaultValue
+    if  not (value is "" or value == "undefined" or value == None) :
+        if  isinstance(defaultValue, (int, float)):
+            value = int(value)
+
+#        print "setting:", propertyName, ": ", value
+        setDeviceProperty(getName(), propertyName, value)
+        return value
+
+
+    return defaultValue
+
+
+
+# Purpose:
+# Update function.  Is called once each update.
+def loop():
+    updateState()
+    delay(1000);
+
+
+# Purpose:
+# Update the sound state, reading from the slot and playing the approperiate sound.
+def updateState():
+    global g_currSound
+    playValue = 255*(analogRead(A0)/1023.0)
+    if 0 > playValue:
+        playValue = 0
+
+    elif playValue > 255:
+        playValue = 255
+        
+    setDeviceProperty(getName(), 'SOUND_dB', int(playValue * (60./255)))
+
+    if -1 != g_currSound:
+        stopSound(g_sounds[g_currSound].soundID)
+
+
+    if 0 == playValue:
+        g_currSound = -1
+    else:
+        g_currSound = int((playValue-1) / (255./len(g_sounds)));
+
+
+    if -1 is not g_currSound:
+        playSound(g_sounds[g_currSound].soundID, 1)
+
+    IoEClient.reportStates(g_currSound)
+    setDeviceProperty(getName(), "Signal", g_currSound)
+    updateEnvironment()
+
+def updateEnvironment():
+    volumeRatio = VOLUME_AT_RATE / Environment.getVolume()
+    if g_currSound >= 0:
+        Environment.setContribution("Sound Volume", SOUND_VOLUME*volumeRatio, SOUND_VOLUME*volumeRatio, False)
+        Environment.setContribution("Sound Pitch", SOUND_PITCH*(g_currSound+1), SOUND_PITCH*(g_currSound+1), False)
+        Environment.setContribution("White Noise", SOUND_WHITE_NOISE, SOUND_WHITE_NOISE, False)
+    else:
+        Environment.setContribution("Sound Volume", 0, 0, False)
+        Environment.setContribution("Sound Pitch", 0, 0, False)
+        Environment.setContribution("White Noise", 0, 0, False)
+
+if __name__ == "__main__":
+    setup()
+    while True:
+        loop()
+        sleep(0)
+        
+
+
+-->Garage Door
+
+
+from time import *
+from physical import *
+from gpio import *
+from environment import Environment
+from ioeclient import IoEClient
+
+ENVIRONMENTS = [
+    "Argon", "CO", "CO2", "Hydrogen", "Helium", "Methane", 
+    "Nitrogen", "O2", "Ozone", "Propane", "Smoke"]
+ENVIRONMENT_MAX_IMPACT = -0.04 # 4% max when door opens
+TEMPERATURE_TRANSFERENCE_MULTIPLIER = 1.50 # increase speed 25% when door open
+HUMIDITY_TRANSFERENCE_MULTIPLIER = 1.50
+GASES_TRANSFERENCE_MULTIPLIER = 2
+
+state = 0 # 0 off, 1 on
+
+def on_event_detect_0 () :
+    processData(customRead(0), False)
+
+def on_input_receive(input) :
+    processData(input, True)
+
+
+def setup ():
+    global state
+    IoEClient.setup ({
+        "type": "Garage Door",
+        "states": [{
+            "name": "On",
+            "type": "bool",
+            "controllable": True
+        }]
+    })
+
+    IoEClient.onInputReceive(on_input_receive) 
+
+    add_event_detect(0, on_event_detect_0)
+
+    state = restoreProperty("state", 0);
+    setState(state)
+
+
+def restoreProperty (propertyName, defaultValue):
+    value = getDeviceProperty(getName(), propertyName)
+    if value :
+        if isinstance(defaultValue, (int, float)):
+            value = int(value)
+
+        setDeviceProperty(getName(), propertyName, value)
+        return value
+
+    return defaultValue
+
+
+def mouseEvent (pressed, x, y, firstPress):
+    if  firstPress :
+        setState(0 if state else 1)
+
+
+def updateEnvironment ():
+    if  state == 1:
+        for e in ENVIRONMENTS:
+            emax = Environment.get(e) * ENVIRONMENT_MAX_IMPACT
+            # the emax is reached in an hour, so we divide by 3600 to get seconds
+            # then this rate is also based on 100,000 cubic meters (approx. coporate office size)
+            rate = emax / 3600 * 100000 / Environment.getVolume()
+            Environment.setContribution(e, rate, emax, True)
+            Environment.setTransferenceMultiplier(e, GASES_TRANSFERENCE_MULTIPLIER)
+
+        Environment.setTransferenceMultiplier("Ambient Temperature", TEMPERATURE_TRANSFERENCE_MULTIPLIER)
+        Environment.setTransferenceMultiplier("Humidity", HUMIDITY_TRANSFERENCE_MULTIPLIER)
+    else:
+        for  e in ENVIRONMENTS:
+            Environment.setContribution(e, 0, 0, True)
+            Environment.removeCumulativeContribution(e)
+            Environment.setTransferenceMultiplier(e, 1)
+
+        Environment.setTransferenceMultiplier("Ambient Temperature", 1)
+        Environment.setTransferenceMultiplier("Humidity", 1)
+
+
+def processData (data, bIsRemote):
+    if  data is None or data is "":
+        return
+
+    setState(int(data))
+
+
+def setState (newState):
+    global state
+    state = newState
+
+    digitalWrite(1, HIGH if state else LOW)
+    customWrite(0, state)
+    IoEClient.reportStates(state)
+    setDeviceProperty(getName(), "state", state)
+
+    updateEnvironment()
+
+
+if __name__ == "__main__":
+    setup()
+    while True:
+        sleep(0)
+
+
+-->Smoke Detector
+
+from gpio import *
+from time import *
+from ioeclient import *
+from physical import *
+import math
+from environment import *
+
+ENVIRONMENT_NAME = "Smoke"
+
+state = 0
+level = 0
+ALARM_LEVEL = 40
+
+def main():
+    setup()
+    while True:
+		loop()
+		
+def setup():
+    IoEClient.setup({
+        "type": "Smoke Detector",
+        "states": [{
+            "name": "Alarm",
+            "type": "bool",
+            "controllable": False
+        },
+        {
+            "name": "Level",
+            "type": "number",
+            "controllable": False
+        }]
+    })
+
+    restoreProperty("Alarm Level", 40)
+    IoEClient.onInputReceive(onInputReceiveDone)
+    add_event_detect(0, detect)
+    
+    state = restoreProperty("state", 0)
+    setState(state)
+
+def onInputReceiveDone(data):
+    processData(data, True)
+    
+def detect():
+    processData(customRead(0), False)
+
+def restoreProperty(propertyName, defaultValue):
+    value = getDeviceProperty(getName(), propertyName)
+    if  not (value is "" or value is None):
+        if  type(defaultValue) is int :
+            value = int(value)
+
+        setDeviceProperty(getName(), propertyName, value)
+        return value
+    return defaultValue
+
+def loop():
+    global ENVIRONMENT_NAME
+    value = Environment.get(ENVIRONMENT_NAME)
+    if value >= 0:
+        setLevel(Environment.get(ENVIRONMENT_NAME))
+    #print(value)
+    sleep(1)
+
+
+def processData(data, bIsRemote):
+    if len(data) <= 0 :
+        return
+    data = data.split(",")
+    setState(int(data[0]))
+
+
+def sendReport():
+    global state
+    global level
+    report = str(state) + "," + str(level);   # comma seperated states
+    IoEClient.reportStates(report)
+    setDeviceProperty(getName(), "state", state)
+    setDeviceProperty(getName(), "level", level)
+
+
+def setState(newState):
+    global state
+    state = newState
+
+    if newState is 0:
+        digitalWrite(1, LOW)
+    else:
+        digitalWrite(1, HIGH)
+
+    sendReport()
+
+
+def setLevel(newLevel):
+    global level
+    if level == newLevel:
+        return
+
+    level = newLevel
+    if level > ALARM_LEVEL:
+        setState(1)
+    else:
+        setState(0)
+
+    sendReport()
+
+if __name__ == "__main__":
+    main()
+
+-->Webcam
+
+from gpio import *
+from time import *
+from ioeclient import *
+from physical import *
+from environment import *
+import math
+
+state = 0
+
+def main():
+	setup()
+	while True:
+		loop()
+		
+#set up client to talk and listen to IoE registration server
+def setup():
+    global state
+    IoEClient.setup({
+        "type": "Webcam",
+        "states": [{
+            "name": "On",
+            "type": "bool",
+            "controllable": True
+        },
+        {
+            "name": "Image",
+            "type": "image"
+        }]
+    })
+
+    IoEClient.onInputReceive(onInputReceiveDone)
+    add_event_detect(0, detect)
+
+    state = restoreProperty("state", 0)
+    sendReport()
+
+def onInputReceiveDone(data):
+    processData(data, True)
+    
+def detect():
+    processData(customRead(0), False)
+    
+def restoreProperty(propertyName, defaultValue):
+    value = getDeviceProperty(getName(), propertyName)
+    if  not (value is "" or value is None):
+        if  type(defaultValue) is int :
+            value = int(value)
+
+        setDeviceProperty(getName(), propertyName, value)
+        return value
+    return defaultValue
+
+def mouseEvent(pressed, x, y, firstPress):
+    global state
+    if firstPress:
+        if state == True:
+        	setState(0)
+        else:
+        	setState(1)
+
+
+#send captured image file path to registration server
+def loop():
+    sendReport()
+    delay(1000)
+
+
+#process data received from server
+def processData(data, bIsRemote):
+    if  len(data) <= 0 :
+        return
+    data = data.split(",")
+    setState(int(data[0]))
+
+
+#send image path to server
+imageLoop=0
+def sendReport():
+    global state
+    global imageLoop
+    report = str(state) + ","   # comma seperated states
+
+    if state is 0:
+        report += '../art/IoE/SmartDevices/camera_off.png'
+    else:
+        report += '../art/IoE/SmartDevices/camera_image'+ str(imageLoop)+'.png'
+        imageLoop = imageLoop + 1
+        if  imageLoop >= 3:
+            imageLoop =0
+    
+    customWrite(0, report)
+    IoEClient.reportStates(report)
+    setDeviceProperty(getName(), "state", state)
+
+
+#set state and update component image to reflect the current state
+def setState(newState):
+    global state
+    if  newState is 0 :
+        digitalWrite(1, LOW)
+    else:
+        digitalWrite(1, HIGH)
+
+    state = newState
+    
+if __name__ == "__main__":
+    main()
+
+
+-->power meter
+
+from time import *
+import math
+from physical import *
+from gpio import *
+from environment import Environment
+from ioeclient import IoEClient
+#from pyjs import *
+
+
+electricity = 0        # var electricity
+MULTIPLIER = 255. / 1023        # var MULTIPLIER
+LOG_BASE = 1.0749111034571373359815489867558        # var LOG_BASE
+
+
+def setup ():
+    
+    IoEClient.setup({
+        "type": "Power Meter",
+        "states": [{
+            "name": "Status",
+            "type": "number",
+            "unit": 'Watts',
+            "controllable": False
+        }]
+    })
+
+    IoEClient.onInputReceive( lambda rinput:  processData(rinput, True) )
+
+    sendReport()
+
+
+
+def makeDisplayText (electricity):
+    if electricity < 2:
+        return str(math.floor(0)) + " Wh"
+    elif electricity < 1000:
+        return str(math.floor(electricity)) + " Wh"
+    elif electricity < 1000000:
+        return str(math.floor(electricity / 1000)) + " kWh"
+    elif electricity < 1000000:
+        return str(math.floor(electricity / 1000000)) + " MWh"
+
+
+
+def loop ():
+    global electricity
+    log_electricity = int(analogRead(0)) * MULTIPLIER        # var log_electricity
+    electricity = math.pow(LOG_BASE, log_electricity)
+    analogWrite(1, log_electricity) # the reciever has to understand that this is a log() of value
+    #print(electricity)
+    setCustomText(30, 17, 100, 100, makeDisplayText(electricity))
+    sendReport()
+    sleep(0.5)
+
+
+
+def sendReport ():
+    IoEClient.reportStates(electricity)
+    setDeviceProperty(getName(), "Power", makeDisplayText(electricity))
+
+
+if __name__ == "__main__":
+    setup()
+    while True:
+        loop()
+        sleep(0)
+
+-->Wind Detector
+
+from options import Options
+from time import *
+import math
+from physical import *
+from gpio import *
+from environment import Environment
+from ioeclient import IoEClient
+
+
+ENVIRONMENT_NAME = "Wind Speed"        # var ENVIRONMENT_NAME
+state = 0        # var state
+tick = 0        # var tick
+
+# set up client to talk and listen to IoE registration server
+
+def setup ():
+    
+    IoEClient.setup({
+        "type": "Wind Detector",
+        "states": [{
+            "name": "Wind",
+            "type": "bool",
+            "controllable": False
+        }]
+    })
+    
+    IoEClient.onInputReceive ( lambda rinput: processData(input, True) )
+
+    setState(state)
+    sendReport()
+
+
+
+# continously checking if WIND exist and send report to registration server
+
+def loop ():
+    global tick 
+
+    if tick % 10 == 0: # is tick consistent across devices?
+        detect()
+        sendReport()
+    tick += 1
+    
+
+
+# get WIND variable defined in Environment
+
+def detect ():
+    value = Environment.get(ENVIRONMENT_NAME)        # var value
+
+    if value >= 1:
+        setState(1)
+    else:
+        setState(0)
+
+
+# process data received from server
+# not being called since controllable set to False in client setup
+
+def processData (data, bIsRemote):
+    if len(data) <= 0:
+        return
+    data = data.split(",")        # var data
+    setState(int(data[0]))
+
+
+# send wind state  to the server
+
+def sendReport ():
+    report = state # comma seperated states        # var report
+    IoEClient.reportStates(report)
+
+
+# set state and update component image to reflect the current state
+
+def setState (newState):
+    global state
+    if newState == 0:
+        digitalWrite(1, LOW)
+    else:
+        digitalWrite(1, HIGH)
+
+    state = newState
+
+    sendReport()
+
+
+# toggle wind state
+
+def toggleState ():
+    if state == 0:
+        setState(1)
+    else:
+        setState(0)
+
+
+if __name__ == "__main__":
+    setup()
+    while True:
+        loop()
+        sleep(0)
+
+
+-->Solar Panel
+
+from options import Options
+from time import *
+import math
+from physical import *
+from gpio import *
+from environment import Environment
+from ioeclient import IoEClient
+#from pyjs import *
+
+
+#Solar Panel
+#Read the sunlight levels
+#Output electricity based on sunlight
+#Panel will be 160Watts per square meter
+
+#Features output to IoE Server:
+# number of kWh of energy produced since turning on
+# number of kWh per minute
+# current production
+ENVIRONMENT_NAME = "Sunlight"        # var ENVIRONMENT_NAME
+MULTIPLIER = 255. / 1023        # var MULTIPLIER
+MAX_POWER = 1000. #1000 Watts of power based on one meter solar panel at noon at the equator        # var MAX_POWER
+EFFICIENCY = 0.16 #About a 16 percent efficiency per solar panel        # var EFFICIENCY
+PANEL_POWER = MAX_POWER * EFFICIENCY        # var PANEL_POWER
+LOG_BASE = 1.0749111034571373359815489867558        # var LOG_BASE
+
+state = 1        # var state
+electricity = 0        # var electricity
+#tick = 0        # var tick
+
+
+def setup ():
+    
+    IoEClient.setup({
+        "type": "Solar",
+        "states": [{
+            "name": "Status",
+            "type": "number",
+            "unit": 'Wh',
+            "controllable": False
+        }]
+    })
+
+    IoEClient.onInputReceive ( lambda rinput: processData(rinput, True) )
+
+    sendReport()
+
+
+
+
+def loop ():
+    global electricity
+    ##    if  (tick++ % 10) is 0 )    # is tick consistent across devices?
+    ##    {
+    electricity = int(getElectricityProduction())
+    ##print(electricity)
+    displayElectricity()
+    sendReport()
+    outputElectricity()
+    delay(1000)
+    ##    
+
+
+
+def displayElectricity ():
+    setCustomText(70, 45, 1000, 1000, str(int(electricity)) + '\tW')
+
+
+
+def getElectricityProduction ():
+    return PANEL_POWER * Environment.get(ENVIRONMENT_NAME) / 100
+
+
+
+def sendReport ():
+    report = state # comma seperated states        # var report
+    IoEClient.reportStates(electricity)
+    setDeviceProperty(getName(), "level", electricity)
+
+
+
+def outputElectricity ():
+    el_log = math.floor(math.log(electricity) / math.log(LOG_BASE))        # var el_log
+    if el_log < 0:
+        el_log = 0
+    elif el_log > 255:
+        el_log = 255
+    ##    print(el_log)
+    analogWrite(0, el_log)
+
+
+
+
+
+if __name__ == "__main__":
+    setup()
+    while True:
+        loop()
+        sleep(0)
+
+
+-->Furnace
+
+from gpio import *
+from time import *
+from ioeclient import *
+from environment import *
+from physical import *
+
+HUMIDITY_RATE = -2./3600; # -2% per hour
+TEMPERATURE_RATE = 10./3600; # 10C per hour
+VOLUME_AT_RATE = 100000.
+
+myinput = 0
+state = 0
+def setup():
+    global state
+    IoEClient.setup({
+        "type": "Furnace",
+        "states": [{
+            "name": "On",
+            "type": "bool",
+            "controllable": True
+        }]
+    })
+
+    IoEClient.onInputReceive(onInputReceiveDone)
+
+    add_event_detect(0, detect)
+
+    state = restoreProperty("state", 0)
+    setState(state)
+    detect()
+    
+    VAR = getDeviceProperty(getName(), "VOLUME_AT_RATE")
+    if not VAR:
+    	setDeviceProperty(getName(), "VOLUME_AT_RATE", VOLUME_AT_RATE)
+
+def detect():
+    processData(digitalRead(0)/1023)
+    
+    
+def onInputReceiveDone(data):
+    if  len(data) <= 0 :
+        return
+    data = data.split(",")
+    processData(int(data[0]))
+        
+def restoreProperty(propertyName, defaultValue):
+    value = getDeviceProperty(getName(), propertyName)
+    if  not (value is "" or value is None):
+        if  type(defaultValue) is int :
+            value = int(value)
+
+        setDeviceProperty(getName(), propertyName, value)
+        return value
+    return defaultValue
+
+
+def setState(newState):
+    global state
+    state = newState
+    setDeviceProperty(getName(), "state", state)
+
+
+
+def processData(data):
+    global state, myinput
+    state = data
+    myinput = data
+    if  myinput > 0 :
+        digitalWrite(5, HIGH)
+    else:
+        digitalWrite(5, LOW)
+    IoEClient.reportStates(myinput)
+    setDeviceProperty(getName(), "state", state)
+
+
+def main():
+    setup()
+    while True:
+        updateEnvironment()
+        delay(1000)
+
+
+
+def updateEnvironment():
+    VAR = float(getDeviceProperty(getName(), "VOLUME_AT_RATE"))
+    if VAR < 0:
+    	VAR = 0
+    	
+    humidity_rate = float(myinput*HUMIDITY_RATE*VAR) / Environment.getVolume()
+    temperature_rate = float(myinput*TEMPERATURE_RATE*VAR) / Environment.getVolume()
+    Environment.setContribution("Humidity", humidity_rate, 0, True)
+    Environment.setContribution("Ambient Temperature", temperature_rate, 1000, True)
+    #print temperature_rate, VAR
+
+if __name__ == "__main__":
+	main()
+
+
+-->Appliance
+
+from gpio import *
+from time import *
+from ioeclient import *
+from environment import *
+from physical import *
+
+state = 0
+
+def main():
+    setup()
+    global state
+    while True:
+        state = restoreProperty("state", 0)
+        setState(state)
+        delay(1000)
+        
+def setup():
+    IoEClient.setup({
+        "type": "Appliance",
+        "states": [{
+            "name": "On",
+            "type": "bool",
+            "controllable": True
+        }]
+    })
+    IoEClient.onInputReceive(onInputReceiveDone)
+    add_event_detect(0, detect)
+        
+def onInputReceiveDone(data):
+    processData(data, True)
+        
+
+def detect():
+    processData(customRead(0), False)
+    
+def restoreProperty(propertyName, defaultValue):
+    value = getDeviceProperty(getName(), propertyName)
+    if  not (value is "" or value is None):
+        if  type(defaultValue) is int :
+            value = int(value)
+
+        setDeviceProperty(getName(), propertyName, value)
+        return value
+    return defaultValue
+
+
+def mouseEvent(pressed, x, y, firstPress):
+    global state
+    if firstPress:
+        if state == True:
+        	setState(0)
+        else:
+        	setState(1)
+
+
+def processData(data, bIsRemote):
+    if  len(data) <= 0 :
+        return
+    setState(int(data))
+
+
+def setState(newState):
+    global state
+    state = newState
+
+    if  state == 0 :
+        digitalWrite(1, LOW)
+    else:
+        digitalWrite(1, HIGH)
+    customWrite(0, state)
+    IoEClient.reportStates(state)
+    setDeviceProperty(getName(), "state", state)
+
+if __name__ == "__main__":
+	main()
