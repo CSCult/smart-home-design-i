@@ -1,0 +1,1429 @@
+-->Air Conditioner (AC)
+
+var HUMIDITY_RATE = -2/3600; // -2% per hour
+var TEMPERATURE_RATE = -10/3600; // -10C per hour
+var VOLUME_AT_RATE = 100000;
+
+var input;
+function setup() {
+	IoEClient.setup({
+		type: "AC",
+		states: [{
+			name: "On",
+			type: "bool",
+			controllable: true
+		}]
+	});
+	
+	IoEClient.onInputReceive = function(data) {
+		if ( data.length <= 0  )
+			return;
+		data = data.split(",");
+		processData(parseInt(data[0]));
+	};
+
+	attachInterrupt(0, function() {
+		processData(digitalRead(0)/1023);
+	});
+
+	processData(digitalRead(0)/1023);
+	
+	var VAR = getDeviceProperty(getName(), "VOLUME_AT_RATE");
+	if(!VAR)
+		setDeviceProperty(getName(), "VOLUME_AT_RATE", VOLUME_AT_RATE);
+}
+
+function processData(data) {
+	input = data;
+	if ( input > 0 )
+		digitalWrite(5, HIGH);
+	else
+		digitalWrite(5, LOW);
+	IoEClient.reportStates(input);
+}
+
+function loop()
+{
+	updateEnvironment();
+	delay(1000);
+}
+
+
+function updateEnvironment()
+{
+	var VAR = parseFloat(getDeviceProperty(getName(), "VOLUME_AT_RATE"));
+	if( VAR < 0 )
+		VAR = VOLUME_AT_RATE;
+	//Serial.println("VAR: " + VAR);
+	//Serial.println("input: " + input);
+
+	var humidity_rate = input*HUMIDITY_RATE * VAR / Environment.getVolume();
+	var temperature_rate = input*TEMPERATURE_RATE * VAR / Environment.getVolume();
+	Environment.setContribution("Humidity", humidity_rate);
+	Environment.setContribution("Ambient Temperature", temperature_rate);
+	
+	//Serial.println("T rate: " + temperature_rate);
+}
+
+
+-->Fan
+
+from gpio import *
+from time import *
+from ioeclient import *
+from physical import *
+from environment import *
+import math
+FAN_SPEED_LOW = 0.4; # kph
+FAN_SPEED_HIGH = 0.8; # kph
+COOLING_RATE = float(-1)/3600; # -1C/hour
+HUMDITY_REDUCTION_RATE = float(-1)/3600; # -1%/hour
+
+VOLUME_AT_RATE = 100000;    # the given rates are based on this volume
+
+state = 0;  # 0 off, 1 low, 2 high
+level = 0
+
+def main():
+    global state
+    IoEClient.setup({
+        "type": "Ceiling Fan",
+        "states": [
+        {
+            "name": "Status",
+            "type": "options",
+            "options": {
+                "0": "Off",
+                "1": "Low",
+                "2": "High"
+            },
+            "controllable": True
+        }
+        ]
+    })
+
+    IoEClient.onInputReceive(onInputReceiveDone)
+    add_event_detect(0, detect)
+    state = restoreProperty("state", 0)
+    setState(state)
+    while True:
+        delay(1000)
+
+def onInputReceiveDone(data):
+    processData(data, True)
+    
+def detect():
+    processData(customRead(0), False)
+    
+def restoreProperty(propertyName, defaultValue):
+    value = getDeviceProperty(getName(), propertyName)
+    if  not (value is "" or value is None):
+        if  type(defaultValue) is int :
+            value = int(value)
+
+        setDeviceProperty(getName(), propertyName, value)
+        return value
+    return defaultValue
+
+def mouseEvent(pressed, x, y, firstPress):
+    if firstPress:
+        toggleState()
+
+
+def processData(data, bIsRemote):
+    if  len(data) <= 0 :
+        return
+    data = data.split(",")
+    setState(int(data[0]))
+
+def sendReport():
+    global state
+    global report
+    report = state # comma seperated states
+    customWrite(0, report)
+    IoEClient.reportStates(report)
+    setDeviceProperty(getName(), "state", state)
+
+
+def setState(newState):
+    global state
+    analogWrite(A1, newState)
+    state = newState
+
+    sendReport()
+    updateEnvironment()
+
+def toggleState():
+    global state
+    state += 1
+    if  int(state) >= 3:
+        state = 0
+
+    setState(state)
+
+def updateEnvironment():
+    global VOLUME_AT_RATE
+    global FAN_SPEED_LOW
+    global COOLING_RATE
+    global HUMDITY_REDUCTION_RATE
+    global FAN_SPEED_HIGH
+    global state
+    volumeRatio = float(VOLUME_AT_RATE) / Environment.getVolume()
+
+    if  int(state) == 0:
+        Environment.setContribution("Wind Speed", 0, 0, True)
+        Environment.setContribution("Ambient Temperature", 0, 0, True)
+        Environment.setContribution("Humidity", 0,0, True)
+
+    elif  int(state) == 1:
+        Environment.setContribution("Wind Speed", FAN_SPEED_LOW, FAN_SPEED_LOW, False)
+
+        # everytime the fan restarts, it can do another -100C
+        Environment.setContribution("Ambient Temperature", float(COOLING_RATE)/2*volumeRatio, Environment.getCumulativeContribution("Ambient Temperature")-100, True)
+
+        Environment.setContribution("Humidity", float(HUMDITY_REDUCTION_RATE)/2*volumeRatio, Environment.getCumulativeContribution("Humidity")-100, True)
+    elif  int(state) == 2:
+        Environment.setContribution("Wind Speed", FAN_SPEED_HIGH, FAN_SPEED_HIGH, False)
+
+        Environment.setContribution("Ambient Temperature", float(COOLING_RATE)/2*volumeRatio, Environment.getCumulativeContribution("Ambient Temperature")-100, True)
+
+        Environment.setContribution("Humidity", HUMDITY_REDUCTION_RATE*volumeRatio, Environment.getCumulativeContribution("Humidity")-100, True)
+
+if __name__ == "__main__":
+    main()
+
+-->Window
+
+var ENVIRONMENTS = ["Argon", "CO", "CO2", "Hydrogen", "Helium", "Methane", "Nitrogen", "O2", "Ozone", "Propane", "Smoke"];
+var ENVIRONMENT_MAX_IMPACT = -0.01; // 2% max when door opens
+var TEMPERATURE_TRANSFERENCE_MULTIPLIER = 1.20; // increase speed 25% when door open
+var HUMIDITY_TRANSFERENCE_MULTIPLIER = 1.20;
+var GASES_TRANSFERENCE_MULTIPLIER = 2;
+
+var state = 0;
+
+//set up client to talk and listen to IoE registration server
+function setup() {
+	IoEClient.setup({
+		type: "Window",
+		states: [{
+			name: "On",
+			type: "bool",
+			controllable: true
+		}]
+	});
+	
+	IoEClient.onInputReceive = function(input) {
+		processData(input, true);
+	};
+	
+	attachInterrupt(0, function() {
+		processData(customRead(0), false);
+	});
+	
+	state = restoreProperty("state", 0);
+	setState(state);
+}
+
+function restoreProperty(propertyName, defaultValue)
+{
+	var value = getDeviceProperty(getName(), propertyName);
+	if ( !(value === "" || value == "undefined") ){
+		if ( typeof(defaultValue) == "number" )
+			value = Number(value);
+		
+		setDeviceProperty(getName(), propertyName, value);
+		return value;
+	}
+	
+	return defaultValue;
+}
+
+function mouseEvent(pressed, x, y, firstPress) {
+	if (firstPress)
+		setState(state ? 0 : 1);
+}
+
+//update carbon dioxide and carbon monoxide and send new data to registration server
+function loop() {
+	updateEnvironment();	
+	delay(1000);
+}
+
+//process data received from server
+function processData(data, bIsRemote)
+{
+	if ( data.length <= 0  )
+		return;
+	data = data.split(",");
+	setState(parseInt(data[0]));
+}
+
+//set state and update component image to reflect the current state
+function setState(newState)
+{
+	if ( newState === 0 )
+		digitalWrite(1, LOW);
+	else{
+		digitalWrite(1, HIGH);
+	}
+	state = newState;
+	customWrite(0, state);
+	IoEClient.reportStates(state);
+	setDeviceProperty(getName(), "state", state);
+}
+
+function updateEnvironment()
+{
+	var rate,max;
+	if ( state == 1)
+	{
+		for(var i=0; i<ENVIRONMENTS.length; i++){
+			max = Environment.get(ENVIRONMENTS[i]) * ENVIRONMENT_MAX_IMPACT;
+			// the max is reached in an hour, so we divide by 3600 to get seconds
+			// then this rate is also based on 100,000 cubic meters (approx. coporate office size)
+			rate = max / 3600 * 100000 / Environment.getVolume();
+			Environment.setContribution(ENVIRONMENTS[i], rate, max);
+			Environment.setTransferenceMultiplier(ENVIRONMENTS[i], GASES_TRANSFERENCE_MULTIPLIER);
+
+		}
+		
+		Environment.setTransferenceMultiplier("Ambient Temperature", TEMPERATURE_TRANSFERENCE_MULTIPLIER);
+		Environment.setTransferenceMultiplier("Humidity", HUMIDITY_TRANSFERENCE_MULTIPLIER);
+	}
+	else
+	{
+		for(var j=0; j<ENVIRONMENTS.length; j++){
+			Environment.setContribution(ENVIRONMENTS[j], 0, 0);
+			Environment.removeCumulativeContribution(ENVIRONMENTS[j]);
+			Environment.setTransferenceMultiplier(ENVIRONMENTS[j], 1);
+		}
+		Environment.setTransferenceMultiplier("Ambient Temperature", 1);
+		Environment.setTransferenceMultiplier("Humidity", 1);
+		
+	}
+}
+
+-->Door
+
+
+var ENVIRONMENTS = ["Argon", "CO", "CO2", "Hydrogen", "Helium", "Methane", "Nitrogen", "O2", "Ozone", "Propane", "Smoke"];
+var ENVIRONMENT_MAX_IMPACT = -0.02; // 2% max when door opens
+var TEMPERATURE_TRANSFERENCE_MULTIPLIER = 1.25; // increase speed 25% when door open
+var HUMIDITY_TRANSFERENCE_MULTIPLIER = 1.25;
+var GASES_TRANSFERENCE_MULTIPLIER = 2;
+
+var doorState = 0;	// 0 is closed, 1 is opened
+var lockState = 0;  // 0 is unlocked, 1 is locked
+
+function setup () {
+	IoEClient.setup({
+		type: "Door",
+		states: [{
+			name: "Open",
+			type: "bool"
+		}, {
+			name: "Lock",
+			type: "options",
+			options: {
+				"0": "Unlock",
+				"1": "Lock"
+			},
+			controllable: true
+		}]
+	});
+	
+	IoEClient.onInputReceive = function (input) {
+		processData(input, true);
+	};
+	
+	attachInterrupt(0, function () {
+		processData(customRead(0), false);
+	});
+	
+	setDoorState(doorState);
+	setLockState(lockState);
+}
+
+function mouseEvent (pressed, x, y, firstPress) {
+	if (firstPress) {
+		if ( isPointInRectangle(x, y, 10,40,5,10) )
+		{
+			if ( lockState === 0 ) {
+				setLockState(1);
+            } else {
+				setLockState(0);
+            }
+		} else {
+			if ( doorState === 0 ) {
+				openDoor();
+            } else {
+				closeDoor();
+            }
+		}		
+	}
+}
+
+function loop () {
+	
+}
+
+function processData (data, bIsRemote) {
+	if ( data.length <= 0  ) {
+		return;
+    }
+	Serial.println(data);
+	
+	data = data.split(",");
+	var doorStateData = parseInt(data[0]);
+	var lockStateData = parseInt(data[1]);
+	if ( lockStateData > -1 ) {
+		setLockState(lockStateData);
+    }
+	
+	if ( doorStateData > -1 && !bIsRemote ) {
+		if ( doorStateData === 0 ) { 
+			closeDoor();
+        } else {
+			openDoor();
+        }
+	}
+}
+function sendReport () {
+	var report = doorState+","+lockState;	// comma seperated states
+	customWrite(0, report);
+
+	IoEClient.reportStates(report);
+	setDeviceProperty(getName(), "door state", doorState);
+	setDeviceProperty(getName(), "lock state", lockState);
+}
+
+function closeDoor () {
+	setDoorState(0);
+	updateEnvironment();
+}
+
+function openDoor () {
+	if ( lockState===0 ) {
+		setDoorState(1);
+		updateEnvironment();
+	} else {
+		Serial.println("can't open locked door");
+	}
+	
+	
+}
+
+function setDoorState (state) {
+	if ( state === 0) {
+		digitalWrite(1, LOW);
+		setComponentOpacity("led", 1);	// show the led
+	} else {
+		digitalWrite(1, HIGH);
+		setComponentOpacity("led", 0);	// hide the led
+	}
+	doorState = state;
+	sendReport();
+}
+
+function setLockState (state) {
+	if ( state === 0 ) {
+		digitalWrite(2, LOW);
+    } else {
+		digitalWrite(2, HIGH);
+    }
+	
+	lockState = state;
+	sendReport();
+}
+
+
+function updateEnvironment () {
+	var rate,max;
+	if ( doorState == 1) {
+		for (var i=0; i<ENVIRONMENTS.length; i++) {
+			max = Environment.get(ENVIRONMENTS[i]) * ENVIRONMENT_MAX_IMPACT;
+			// the max is reached in an hour, so we divide by 3600 to get seconds
+			// then this rate is also based on 100,000 cubic meters (approx. coporate office size)
+			rate = max / 3600 * 100000 / Environment.getVolume();
+			Environment.setContribution(ENVIRONMENTS[i], rate, max);
+			Environment.setTransferenceMultiplier(ENVIRONMENTS[i], GASES_TRANSFERENCE_MULTIPLIER);
+		}
+		
+		Environment.setTransferenceMultiplier("Ambient Temperature", TEMPERATURE_TRANSFERENCE_MULTIPLIER);
+		Environment.setTransferenceMultiplier("Humidity", HUMIDITY_TRANSFERENCE_MULTIPLIER);
+	} else {
+		for (var i=0; i<ENVIRONMENTS.length; i++) {
+			Environment.setContribution(ENVIRONMENTS[i], 0, 0);
+			Environment.removeCumulativeContribution(ENVIRONMENTS[i]);
+			Environment.setTransferenceMultiplier(ENVIRONMENTS[i], 1);
+		}
+		Environment.setTransferenceMultiplier("Ambient Temperature", 1);
+		Environment.setTransferenceMultiplier("Humidity", 1);
+	}
+}
+
+function isPointInRectangle (x,y, rx, ry, width, height) {
+	if (width <= 0 || height <= 0) {
+		return false;
+	}
+ 
+	return (x >= rx && x <= rx + width && y >= ry && y <= ry + height);
+}
+
+-->Light
+
+var ENVIRONMENT_IMPACT_DIM = 10;
+var VOLUME_AT_RATE = 100000;
+
+var state = 0;	// 0 off, 1 low, 2 high
+var lastTimeInSeconds = 0;
+
+function setup() {
+
+	IoEClient.setup({
+		type: "Light",
+		states: [
+		{
+			name: "Status",
+			type: "options",
+			options: {
+				"0": "Off",
+				"1": "Dim",
+				"2": "On"
+			},
+			controllable: true
+		}			
+		]
+	});
+	
+	IoEClient.onInputReceive = function(input) {
+		processData(input, true);
+	};
+	
+	attachInterrupt(0, function() {
+		processData(customRead(0), false);
+	});
+
+	state = restoreProperty("state", 0);
+	setState(state);
+}
+
+function restoreProperty(propertyName, defaultValue)
+{
+	var value = getDeviceProperty(getName(), propertyName);
+	if ( !(value === "" || value == "undefined") ){
+		if ( typeof(defaultValue) == "number" )
+			value = Number(value);
+		
+		setDeviceProperty(getName(), propertyName, value);
+		return value;
+	}
+	
+	return defaultValue;
+}
+
+function mouseEvent(pressed, x, y, firstPress) {
+	if (firstPress)
+		setState(state+1);
+}
+
+function loop() {
+	updateEnvironment();
+
+	delay(1000);
+}
+
+function processData(data, bIsRemote) {
+	if ( data.length <= 0  )
+		return;
+	setState(parseInt(data));
+}
+
+function setState(newState) {
+	if (newState >= 3)
+		newState = 0;
+	state = newState;
+	
+	analogWrite(A1, state);
+	customWrite(0, state);
+	IoEClient.reportStates(state);
+	setDeviceProperty(getName(), "state", state);
+}
+
+function updateEnvironment()
+{
+	var volumeRatio = VOLUME_AT_RATE / Environment.getVolume();
+	if ( state === 0 )
+		Environment.setContribution("Visible Light", 0,0);
+	else if ( state === 1)
+		Environment.setContribution("Visible Light", ENVIRONMENT_IMPACT_DIM*volumeRatio, ENVIRONMENT_IMPACT_DIM*volumeRatio, false);
+	else if ( state === 2 )
+		Environment.setContribution("Visible Light", ENVIRONMENT_IMPACT_DIM*2*volumeRatio, ENVIRONMENT_IMPACT_DIM*2*volumeRatio, false);
+}
+
+-->Siren
+
+var state = 0; // 0 off, 1 on
+
+function setup() {
+	IoEClient.setup({
+		type: "Siren",
+		states: [{
+			name: "On",
+			type: "bool",
+			controllable: true
+		}]
+	});
+	
+	IoEClient.onInputReceive = function(input) {
+		processData(input, true);
+	};
+
+	attachInterrupt(0, function() {
+		processData(customRead(0), false);
+	});
+	
+	state = restoreProperty("state", 0);
+	setState(state);
+}
+
+function restoreProperty(propertyName, defaultValue)
+{
+	var value = getDeviceProperty( getName(), propertyName);
+	if ( !(value === "" || value == "undefined") ){
+		if ( typeof(defaultValue) == "number" )
+			value = Number(value);
+		
+		setDeviceProperty( getName(), propertyName, value);
+		return value;
+	}
+	
+	return defaultValue;
+}
+
+
+function mouseEvent(pressed, x, y, firstPress) {
+	if (firstPress)
+		setState(state ? 0 : 1);
+}
+
+function processData(data, bIsRemote) {
+	if ( data.length <= 0  )
+		return;
+	setState(parseInt(data));
+}
+
+function setState(newState) {
+	
+	state = newState;
+
+	digitalWrite(1, state ? HIGH : LOW);
+	customWrite(0, state);
+	IoEClient.reportStates(state);
+	setDeviceProperty( getName(), "state", state);
+}
+
+
+-->Home Speaker
+
+var VOLUME_AT_RATE = 100000;
+var SOUND_VOLUME = 65;
+var SOUND_PITCH = 20;
+var SOUND_WHITE_NOISE = 20;
+
+// Purpose:
+// Home Speaker that can play one of several predefined sounds.
+var g_sounds = [{soundID: 'sound1', soundPath: '/../Sounds/buzzLow.wav'},
+                {soundID: 'sound2', soundPath: '/../Sounds/buzzMedium.wav'},
+                {soundID: 'sound3', soundPath: '/../Sounds/buzzHigh.wav'}];
+                
+var g_currSound = -1;                
+
+// Purpose:
+// Setup the Home Speaker.  Stop any old sounds and add the sounds to use.
+function setup() 
+{
+	setDeviceProperty(getName(), 'SOUND_dB', 0);
+
+	IoEClient.setup({
+	type: 'Home Speaker',
+	states: [{
+		name: 'Signal',
+		type: 'number',
+		controllable: false
+	}]
+	});
+	
+	destroySounds();
+	
+	for(var ind = 0; ind < g_sounds.length; ++ind)
+		addSound(g_sounds[ind].soundID, g_sounds[ind].soundPath);
+	
+	restoreProperty("SOUND_dB", 0);
+	g_currSound = restoreProperty("Signal", -1);
+}
+
+function restoreProperty(propertyName, defaultValue)
+{
+	var value = getDeviceProperty(getName(), propertyName);
+	if ( !(value === "" || value == "undefined") ){
+		if ( typeof(defaultValue) == "number" )
+			value = Number(value);
+		
+		setDeviceProperty(getName(), propertyName, value);
+		return value;
+	}
+	
+	return defaultValue;
+}
+
+
+// Purpose:
+// Update function.  Is called once each update.
+function loop() 
+{
+	updateState();
+	delay(1000);	
+}
+
+// Purpose:
+// Update the sound state, reading from the slot and playing the approperiate sound.
+function updateState()
+{
+	var playValue = 255*(analogRead(A0)/1023);
+	if(0 > playValue)
+		playValue = 0;
+	else if(playValue > 255)
+		playValue = 255;
+	
+	setDeviceProperty(getName(), 'SOUND_dB', playValue * (60/255));
+
+	if(-1 != g_currSound)
+		stopSound(g_sounds[g_currSound].soundID);
+	
+	if(0 === playValue)
+		g_currSound = -1;
+	else
+		g_currSound = Math.floor((playValue-1) / (255/g_sounds.length));	
+	
+	if(-1 !== g_currSound)	
+		playSound(g_sounds[g_currSound].soundID, 1);
+		
+	IoEClient.reportStates(g_currSound);
+	setDeviceProperty(getName(), "Signal", g_currSound);
+	updateEnvironment();
+}
+
+function updateEnvironment()
+{
+	var volumeRatio = VOLUME_AT_RATE / Environment.getVolume();
+	if (g_currSound >= 0)
+	{
+		Environment.setContribution("Sound Volume", SOUND_VOLUME*volumeRatio, SOUND_VOLUME*volumeRatio, false);
+		Environment.setContribution("Sound Pitch", SOUND_PITCH*(g_currSound+1), SOUND_PITCH*(g_currSound+1), false);
+		Environment.setContribution("White Noise", SOUND_WHITE_NOISE, SOUND_WHITE_NOISE, false);
+	}
+	else
+	{
+		Environment.setContribution("Sound Volume", 0);
+		Environment.setContribution("Sound Pitch", 0);
+		Environment.setContribution("White Noise", 0);
+	}
+
+}
+
+-->Garage Door
+
+
+var ENVIRONMENTS = ["Argon", "CO", "CO2", "Hydrogen", "Helium", "Methane", "Nitrogen", "O2", "Ozone", "Propane", "Smoke"];
+var ENVIRONMENT_MAX_IMPACT = -0.04; // 4% max when door opens
+var TEMPERATURE_TRANSFERENCE_MULTIPLIER = 1.50; // increase speed 25% when door open
+var HUMIDITY_TRANSFERENCE_MULTIPLIER = 1.50;
+var GASES_TRANSFERENCE_MULTIPLIER = 2;
+
+var state = 0; // 0 off, 1 on
+
+function setup () {
+	
+	IoEClient.setup ({
+		type: "Garage Door",
+		states: [{
+			name: "On",
+			type: "bool",
+			controllable: true
+		}]
+	});
+	
+	IoEClient.onInputReceive = function (input) {
+		processData(input, true);
+	};
+	
+	attachInterrupt(0, function () {
+		processData(customRead(0), false);
+	});
+	
+	state = restoreProperty("state", 0);	
+	setState(state);
+}
+
+function restoreProperty (propertyName, defaultValue) {
+	var value = getDeviceProperty(getName(), propertyName);
+	if ( !(value === "" || value == "undefined") ) {
+		if ( typeof(defaultValue) == "number" ) {
+			value = Number(value);
+            }
+		
+		setDeviceProperty(getName(), propertyName, value);
+		return value;
+	}
+	
+	return defaultValue;
+}
+
+function mouseEvent (pressed, x, y, firstPress) {
+	if ( firstPress ) {
+		setState(state ? 0 : 1);
+        }
+}
+
+function updateEnvironment () {
+	var rate,max;
+	if ( state == 1) {
+		for (var i=0; i<ENVIRONMENTS.length; i++) {
+			max = Environment.get(ENVIRONMENTS[i]) * ENVIRONMENT_MAX_IMPACT;
+			// the max is reached in an hour, so we divide by 3600 to get seconds
+			// then this rate is also based on 100,000 cubic meters (approx. coporate office size)
+			rate = max / 3600 * 100000 / Environment.getVolume();
+			Environment.setContribution(ENVIRONMENTS[i], rate, max);
+			Environment.setTransferenceMultiplier(ENVIRONMENTS[i], GASES_TRANSFERENCE_MULTIPLIER);
+
+		}
+		
+		Environment.setTransferenceMultiplier("Ambient Temperature", TEMPERATURE_TRANSFERENCE_MULTIPLIER);
+		Environment.setTransferenceMultiplier("Humidity", HUMIDITY_TRANSFERENCE_MULTIPLIER);
+	} else {
+		for ( var j=0; j<ENVIRONMENTS.length; j++ ) {
+			Environment.setContribution(ENVIRONMENTS[j], 0, 0);
+			Environment.removeCumulativeContribution(ENVIRONMENTS[j]);
+			Environment.setTransferenceMultiplier(ENVIRONMENTS[j], 1);
+		}
+		Environment.setTransferenceMultiplier("Ambient Temperature", 1);
+		Environment.setTransferenceMultiplier("Humidity", 1);
+	}
+}
+
+
+function processData (data, bIsRemote) {
+	if ( data.length <= 0  ) {
+		return;
+        }
+	setState(parseInt(data));
+}
+
+function setState (newState) {
+	state = newState;
+
+	digitalWrite(1, state ? HIGH : LOW);
+	customWrite(0, state);
+	IoEClient.reportStates(state);
+	setDeviceProperty(getName(), "state", state);
+	
+	updateEnvironment();
+	
+}
+
+
+-->Smoke Detector
+
+var ENVIRONMENT_NAME = "Smoke";
+
+var state = 0;
+var level = 0;
+var ALARM_LEVEL = 40;
+
+function setup() {
+
+	IoEClient.setup({
+		type: "Smoke Detector",
+		states: [{
+			name: "Alarm",
+			type: "bool",
+			controllable: false
+		},
+		{
+			name: "Level",
+			type: "number",
+			controllable: false
+		}]
+	});
+	
+	IoEClient.onInputReceive = function(input) {
+		processData(input, true);
+	};
+	
+	attachInterrupt(0, function() {
+		processData(customRead(0), false);
+	});
+	
+	state = restoreProperty("state", 0);
+	restoreProperty("Alarm Level", 40);
+	
+	setState(state);
+
+	
+}
+
+function restoreProperty(propertyName, defaultValue)
+{
+	var value = getDeviceProperty(getName(), propertyName);
+	if ( !(value === "" || value == "undefined") ){
+		if ( typeof(defaultValue) == "number" )
+			value = Number(value);
+		
+		setDeviceProperty(getName(), propertyName, value);
+		return value;
+	}
+	
+	return defaultValue;
+}
+
+function loop() {
+	var value = Environment.get(ENVIRONMENT_NAME);
+	//Serial.println(value);
+	if (value >= 0)
+		setLevel(Environment.get(ENVIRONMENT_NAME));
+
+	delay(1000);
+}
+
+function processData(data, bIsRemote) {
+	if (data.length <= 0 )
+		return;
+	data = data.split(",");
+	setState(parseInt(data[0]));
+}
+
+function sendReport()
+{
+	var report = state + "," + level;	// comma seperated states
+	IoEClient.reportStates(report);
+	setDeviceProperty(getName(), "state", state);
+	setDeviceProperty(getName(), "level", level);
+}
+
+function setState(newState) {
+	state = newState;
+
+	if (newState === 0)
+		digitalWrite(1, LOW);
+	else
+		digitalWrite(1, HIGH);
+
+	sendReport();
+}
+
+function setLevel(newLevel) {
+	if (level == newLevel)
+		return;
+		
+	level = newLevel;
+	if (level > ALARM_LEVEL)
+		setState(1);
+	else
+		setState(0);
+	
+	sendReport();
+}
+
+
+-->Webcam
+
+var state = 0;
+
+//set up client to talk and listen to IoE registration server
+function setup() {
+	
+	IoEClient.setup({
+		type: "Webcam",
+		states: [{
+			name: "On",
+			type: "bool",
+			controllable: true
+		},
+		{
+			name: "Image",
+			type: "image"
+		}]
+	});
+	
+	IoEClient.onInputReceive = function(input) {
+		processData(input, true);
+	};
+	
+	attachInterrupt(0, function() {
+		processData(customRead(0), false);
+	});
+	
+	state = restoreProperty("state", 0);
+	sendReport();
+}
+
+function restoreProperty(propertyName, defaultValue)
+{
+	var value = getDeviceProperty(getName(), propertyName);
+	if ( !(value === "" || value == "undefined") ){
+		if ( typeof(defaultValue) == "number" )
+			value = Number(value);
+		
+		setDeviceProperty(getName(), propertyName, value);
+		return value;
+	}
+	
+	return defaultValue;
+}
+
+
+function mouseEvent(pressed, x, y, firstPress) {
+	if (firstPress)
+		setState(state ? 0 : 1);
+}
+
+//send captured image file path to registration server
+function loop() {
+	sendReport();
+	delay(1000);
+}
+
+//process data received from server
+function processData(data, bIsRemote)
+{
+	if ( data.length <= 0  )
+		return;
+	data = data.split(",");
+	setState(parseInt(data[0]));
+}
+
+//send image path to server
+var imageLoop=0;
+function sendReport()
+{
+	var report = state + ",";	// comma seperated states
+	
+	if (state === 0)
+		report += '../art/IoE/SmartDevices/camera_off.png';
+	else{
+		report += '../art/IoE/SmartDevices/camera_image'+imageLoop+'.png';
+		imageLoop++;
+		if ( imageLoop >= 3)
+			imageLoop =0;
+	}
+	customWrite(0, report);
+	IoEClient.reportStates(report);
+	setDeviceProperty(getName(), "state", state);
+	
+}
+
+//set state and update component image to reflect the current state
+function setState(newState)
+{
+	if ( newState === 0 )
+		digitalWrite(1, LOW);
+	else
+		digitalWrite(1, HIGH);
+	
+	state = newState;
+}
+
+
+-->power meter
+
+var electricity = 0;
+var MULTIPLIER = 255/1023;
+var LOG_BASE = 1.0749111034571373359815489867558;
+
+function setup() {
+	IoEClient.setup({
+		type: "Power Meter",
+		states: [
+			{
+			name: "Status",
+			type: "number",
+			unit: 'Watts',
+			controllable: false
+			}
+	 ]
+	 });
+	 
+	 IoEClient.onInputReceive = function(input) {
+	 	processData(input, true);
+	 };
+	
+	sendReport();
+}
+
+function makeDisplayText(electricity){
+	if (electricity < 2)
+		return Math.floor(0) + " Wh";
+	else if (electricity < 1000)
+		return Math.floor(electricity) + " Wh";
+	else if(electricity < 1000000)
+		return Math.floor(electricity/1000) + " kWh";
+	else if(electricity < 1000000)
+		return Math.floor(electricity/1000000) + " MWh";
+}
+
+function loop() {
+	var log_electricity = Math.round(analogRead(0))*MULTIPLIER;
+	electricity = Math.pow(LOG_BASE, log_electricity);
+	analogWrite(1, log_electricity); // the reciever has to understand that this is a log() of value
+	//Serial.println(electricity);
+	setCustomText(30, 17, 100, 100, makeDisplayText(electricity));
+	sendReport();
+	delay(500);
+}
+
+function sendReport()
+{
+	IoEClient.reportStates(electricity);
+	setDeviceProperty(getName(), "Power", makeDisplayText(electricity));
+}
+
+
+-->Wind Detector
+
+var ENVIRONMENT_NAME = "Wind Speed";
+var state = 0;
+var level = 0;
+var tick = 0;
+
+//set up client to talk and listen to IoE registration server
+function setup() {
+	IoEClient.setup({
+		type: "Wind Detector",
+		states: [{
+			name: "Wind",
+			type: "bool",
+			controllable: false
+		}]
+	});
+	
+	IoEClient.onInputReceive = function(input) {
+		processData(input, true);
+	};
+	
+	setState(state);
+	sendReport();
+
+}
+
+//continously checking if WIND exist and send report to registration server
+function loop() {
+
+	if ( (tick++ % 10) === 0 )	// is tick consistent across devices? 
+	{
+		detect();
+		sendReport();
+	}
+}
+
+//get WIND variable defined in Environment
+function detect()
+{
+	var value = Environment.get(ENVIRONMENT_NAME);
+
+	if (value >= 1 )
+		setState(1);
+	else
+		setState(0);
+}
+
+//process data received from server
+//not being called since controllable set to false in client setup
+function processData(data, bIsRemote)
+{
+	if ( data.length <= 0  )
+		return;
+	data = data.split(",");
+	setState(parseInt(data[0]));
+}
+
+//send wind state  to the server
+function sendReport()
+{
+	var report = state;	// comma seperated states
+	IoEClient.reportStates(report);
+}
+
+//set state and update component image to reflect the current state
+function setState(newState)
+{
+	if ( newState === 0 ){
+		digitalWrite(1, LOW);
+	}
+	else{
+		digitalWrite(1, HIGH);
+	}
+	
+	state = newState;
+	
+	sendReport();
+}
+
+//toggle wind state
+function toggleState()
+{
+	if ( state === 0)
+		setState(1);
+	else
+		setState(0);
+}
+
+-->Solar Panel
+
+//Solar Panel
+//Read the sunlight levels
+//Output electricity based on sunlight
+//Panel will be 160Watts per square meter
+
+//Features output to IoE Server:
+// number of kWh of energy produced since turning on
+// number of kWh per minute
+// current production
+var ENVIRONMENT_NAME = "Sunlight";
+var MULTIPLIER = 255/1023;
+var MAX_POWER = 1000;//1000 Watts of power based on one meter solar panel at noon at the equator
+var EFFICIENCY = 0.16;//About a 16 percent efficiency per solar panel
+var PANEL_POWER = MAX_POWER * EFFICIENCY;
+var LOG_BASE = 1.0749111034571373359815489867558;
+
+var state = 1;
+var electricity = 0;
+//var tick = 0;
+
+function setup(){
+	
+	IoEClient.setup({
+		type: "Solar",
+		states: [
+			{
+			name: "Status",
+			type: "number",
+			unit: 'Wh',
+			controllable: false
+			}
+	 ]
+	 });
+	 
+	 IoEClient.onInputReceive = function(input) {
+		// Serial.println("input: " + input);
+	 	processData(input, true);
+	 };
+	
+	
+	sendReport();
+
+}
+
+function loop(){
+//	if ( (tick++ % 10) === 0 )	// is tick consistent across devices? 
+//	{
+		electricity = Math.round(getElectricityProduction());
+		//Serial.println(electricity);
+		displayElectricity();
+		sendReport();
+		outputElectricity();
+		delay(1000);
+//	}
+}
+
+function displayElectricity(){
+	setCustomText(70, 45, 1000, 1000, String(parseInt(electricity)) + '\tW');
+}
+
+function getElectricityProduction(){
+	return PANEL_POWER * Environment.get(ENVIRONMENT_NAME) / 100;
+}
+
+function sendReport()
+{
+	var report = state;	// comma seperated states
+	IoEClient.reportStates(electricity);
+	setDeviceProperty(getName(), "level", electricity);
+}
+
+function outputElectricity(){
+	var el_log = Math.floor(Math.log(electricity)/Math.log(LOG_BASE));
+	if(el_log < 0)
+		el_log = 0;
+	else if (el_log > 255)
+		el_log = 255;
+//	Serial.println(el_log);
+	analogWrite(0, el_log);
+}
+
+
+-->Furnace
+
+var HUMIDITY_RATE = -2/3600; // -2% per hour
+var TEMPERATURE_RATE = 10/3600; // 10C per hour
+var VOLUME_AT_RATE = 100000;
+
+var input = 0;
+var state = 0;
+function setup() {
+	IoEClient.setup({
+		type: "Furnace",
+		states: [{
+			name: "On",
+			type: "bool",
+			controllable: true
+		}]
+	});
+
+	IoEClient.onInputReceive = function(data) {
+		if ( data.length <= 0  )
+			return;
+		data = data.split(",");
+		processData(parseInt(data[0]));
+	};
+
+	attachInterrupt(0, function() {
+		processData(digitalRead(0)/1023);
+	});
+
+	state = restoreProperty("state", 0);
+	setState(state);
+	
+	var VAR = getDeviceProperty(getName(), "VOLUME_AT_RATE");
+	if(!VAR)
+		setDeviceProperty(getName(), "VOLUME_AT_RATE", VOLUME_AT_RATE);
+}
+
+function restoreProperty(propertyName, defaultValue)
+{
+	var value = getDeviceProperty(getName(), propertyName);
+	if ( !(value === "" || value == "undefined") ){
+		if ( typeof(defaultValue) == "number" )
+			value = Number(value);
+		
+		setDeviceProperty(getName(), propertyName, value);
+		return value;
+	}
+	
+	return defaultValue;
+}
+
+function setState(newState)
+{
+	state = newState;
+	setDeviceProperty(getName(), "state", state);
+}
+
+
+function processData(data) {
+	state = data;
+	input = data;
+	if ( input > 0 )
+		digitalWrite(5, HIGH);
+	else
+		digitalWrite(5, LOW);
+	IoEClient.reportStates(input);
+	setDeviceProperty(getName(), "state", state);
+}
+
+function loop()
+{
+	updateEnvironment();
+	delay(1000);
+}
+
+
+function updateEnvironment()
+{
+	var VAR = parseFloat(getDeviceProperty(getName(), "VOLUME_AT_RATE"));
+	if( VAR < 0 )
+		VAR = VOLUME_AT_RATE;
+	//Serial.println("VAR: " + VAR);
+	//Serial.println("input: " + input);
+
+	var humidity_rate = input*HUMIDITY_RATE * VAR / Environment.getVolume();
+	var temperature_rate = input*TEMPERATURE_RATE * VAR / Environment.getVolume();
+	Environment.setContribution("Humidity", humidity_rate);
+	Environment.setContribution("Ambient Temperature", temperature_rate);
+
+	//Serial.println("T rate: " + temperature_rate);
+	
+}
+
+
+-->Appliance
+
+var state = 0;
+
+function setup() {
+	
+	IoEClient.setup({
+		type: "Appliance",
+		states: [{
+			name: "On",
+			type: "bool",
+			controllable: true
+		}]
+	});
+	
+	IoEClient.onInputReceive = function(input) {
+		processData(input, true);
+	};
+	
+	attachInterrupt(0, function() {
+		processData(customRead(0), false);
+	});
+	
+	setState(state);
+}
+
+function mouseEvent(pressed, x, y, firstPress) {
+	if (firstPress)
+		setState(state ? 0 : 1);
+}
+
+function processData(data, bIsRemote) {
+	if ( data.length <= 0  )
+		return;
+	setState(parseInt(data));
+}
+
+function setState(newState) {
+	state = newState;
+	
+	if ( state === 0 )
+		digitalWrite(1, LOW);
+	else
+		digitalWrite(1, HIGH);
+	
+	customWrite(0, state);
+	IoEClient.reportStates(state);
+	setDeviceProperty(getName(), "state", state);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
